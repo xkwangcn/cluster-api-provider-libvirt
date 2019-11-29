@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
+	libvirt "github.com/libvirt/libvirt-go"
 	"github.com/golang/glog"
 	libvirtxml "github.com/libvirt/libvirt-go-xml"
 	providerconfigv1 "github.com/openshift/cluster-api-provider-libvirt/pkg/apis/libvirtproviderconfig/v1beta1"
@@ -46,8 +48,120 @@ func setIgnitionForS390X(domainDef *libvirtxml.Domain, client *libvirtClient, ig
 		return err
 	}
 
+	glog.Infof("[DEBUG] newDiskForConfigDrive for coreos_ignition on s390x ")
+	disk, err := newDiskForConfigDrive(client.connection, ignitionVolumeName)
+	if err != nil {
+		return err
+	}
+	domainDef.Devices.Disks = append(domainDef.Devices.Disks, disk)
+
 	// _fw_cfg isn't supported on s390x, so we use guestfish to inject the ignition for now
-	return injectIgnitionByGuestfish(domainDef, ignitionVolumeName)
+	//return injectIgnitionByGuestfish(domainDef, ignitionVolumeName)
+	return nil
+}
+
+func newDiskForConfigDrive(virConn *libvirt.Connect, volumeKey string) (libvirtxml.DomainDisk, error) {
+	disk := libvirtxml.DomainDisk{
+		Device: "cdrom",
+		Target: &libvirtxml.DomainDiskTarget{
+			// s390 platform doesn't support IDE controller, it shoule be virtio controller
+			Dev: "vdb",
+			Bus: "scsi",
+		},
+		Driver: &libvirtxml.DomainDiskDriver{
+			Name: "qemu",
+			Type: "raw",
+		},
+	}
+	diskVolume, err := virConn.LookupStorageVolByKey(volumeKey)
+	if err != nil {
+		return disk, fmt.Errorf("Can't retrieve volume %s: %v", volumeKey, err)
+	}
+	diskVolumeFile, err := diskVolume.GetPath()
+	if err != nil {
+		return disk, fmt.Errorf("Error retrieving volume file: %s", err)
+	}
+	ignName, err := diskVolume.GetName()
+	if err != nil {
+		return disk, fmt.Errorf("Error get ignition file name: %s", err)
+	}
+	isoVolumeFile, err := ceateIgnitionISO(ignName, diskVolumeFile)
+	if err != nil {
+		return disk, fmt.Errorf("Error generate iso file: %s", err)
+	}
+
+	disk.Source = &libvirtxml.DomainDiskSource{
+		File: &libvirtxml.DomainDiskSourceFile{
+			File: isoVolumeFile,
+		},
+	}
+
+	return disk, nil
+}
+
+
+// CeateIgnitionISO create config drive iso with ignition-config file
+func ceateIgnitionISO(ignName string, ignPath string) (string, error) {
+	glog.Infof("DEBUG: ignName %s, ignPath s%", ignName, ignPath)
+	//mkdir -p /tmp/new-drive/openstack/latest
+	err := os.MkdirAll("/tmp/new-drive/openstack/latest", 0755)
+	if err != nil {
+		return "", fmt.Errorf("Error mkdir for /tmp/new-drive/openstack/latest : %s", err)
+	}
+	//get the ignition contentt
+	userData, err := os.Open(ignPath)
+	glog.Infof("DEBUG: ignition content %s", userData)
+	if err != nil {
+		return "", fmt.Errorf("Error get the ignition content : %s", err)
+	}
+	defer userData.Close()
+	//cp user_data /tmp/new-drive/openstack/latest/user_data
+	newDestinationPath, err := os.Create("/tmp/new-drive/openstack/latest/user_data")
+	glog.Infof("DEBUG: newDestinationPath path %s", newDestinationPath)
+	if err != nil {
+		return "", fmt.Errorf("Error create the file for ignition : %s", err)
+	}
+	if _, err := io.Copy(newDestinationPath, userData); err != nil {
+		return "", fmt.Errorf("Error copy the ignitio content to newDestinationPath : %s", err)
+	}
+	// mkisofs -R -V config-2 -o configdrive.iso /tmp/new-drive
+	glog.Infof("DEBUG: isoDestination path %s", ignPath)
+	//cmd := exec.Command(
+	//	"mkisofs",
+	//	"-R",
+	//	"-V",
+	//	"config-2",
+	//	"-o",
+	//	ignPath,
+	//	"/tmp/new-drive/")
+	cmd := exec.Command(
+		"genisoimage",
+		"-o",
+		ignPath,
+		"-ldots",
+		"-allow-lowercase",
+		"-allow-multidot",
+		"-l",
+		"-quiet",
+		"-J",
+		"-r",
+		"-V",
+		"config-2",
+		"/tmp/new-drive/")
+	glog.Infof("About to execute cmd: %+v", cmd)
+	//ls openstack/latest/user_data
+	//genisoimage -o disk.config -ldots -allow-lowercase -allow-multidot -l -quiet -J -r -V config-2 ./
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("Error while starting the creation of ignition's ISO image: %s", err)
+	}
+	glog.Infof("ISO created at %s", ignPath)
+
+	if err := os.RemoveAll("/tmp/new-drive/openstack"); err != nil {
+		return "", fmt.Errorf("Error remove the file /tmp/new-drive/openstack: %s", err)
+	}
+	glog.Infof("Config drive image for %s created", ignName)
+	return ignPath, nil
 }
 
 func injectIgnitionByGuestfish(domainDef *libvirtxml.Domain, ignitionFile string) error {
